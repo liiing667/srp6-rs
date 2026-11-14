@@ -171,6 +171,15 @@ impl<G: GroupOps> Srp6<G> {
     }
 
     /// Calculates the client's proof and its strong-proof verifier.
+    ///
+    /// # Errors
+    /// Returns [`Srp6Error::InvalidGenerator`] or [`Srp6Error::InvalidMultiplier`]
+    /// if the handshake's `g`/`k` do not match the locally configured group,
+    /// [`Srp6Error::InvalidPublicKey`] if its `B` is not a non-zero element of
+    /// that group, [`Srp6Error::InvalidScrambler`] if `u = H(A | B)` reduces to
+    /// zero, and [`Srp6Error::InvalidPremaster`] if the derived premaster
+    /// secret collapses to zero. Every check runs before the session key is
+    /// derived, so a tampered handshake fails closed.
     pub fn calculate_proof(
         &self,
         handshake: &Handshake<G>,
@@ -188,9 +197,30 @@ impl<G: GroupOps> Srp6<G> {
         password: ClearTextPasswordRef,
         a_exp: G::Exponent,
     ) -> Result<(HandshakeProof<G>, StrongProofVerifier<G>)> {
-        let b_field = handshake.B.to_field(&self.group)?;
-        let g_field = handshake.g.to_field(&self.group)?;
-        let k_field = handshake.k.to_field(&self.group)?;
+        // Boundary first: every wire value is re-validated against the local
+        // group before any arithmetic runs. A malicious server that swaps
+        // `g`, `k` or sends a degenerate `B` must fail closed here instead of
+        // steering the client's computation onto different parameters.
+        let local_g = FieldElement::from_field(&self.group, &self.group.generator());
+        if handshake.g != local_g {
+            return Err(Srp6Error::InvalidGenerator);
+        }
+        let local_k = FieldElement::from_field(
+            &self.group,
+            &self
+                .group
+                .multiplier()
+                .map_err(|_| Srp6Error::InvalidMultiplier)?,
+        );
+        if handshake.k != local_k {
+            return Err(Srp6Error::InvalidMultiplier);
+        }
+        let b_field = handshake
+            .B
+            .to_field(&self.group)
+            .map_err(|_| Srp6Error::InvalidPublicKey)?;
+        let g_field = local_g.to_field(&self.group)?;
+        let k_field = local_k.to_field(&self.group)?;
 
         let a_field = self.group.field_pow(&self.group.generator(), &a_exp);
         let a_public = PublicKey::from_field(&self.group, &a_field);

@@ -41,6 +41,26 @@ pub enum Srp6Error {
     #[error("The provided bytes are not a valid field element of the group")]
     InvalidFieldElement,
 
+    /// The server's public key `B` did not decode to a non-zero element
+    /// modulo the local group's `N`. The check is re-run on the received
+    /// handshake before any arithmetic, so a hand-crafted or corrupted
+    /// handshake fails closed even if it never crossed the typed constructor.
+    #[error("the server public key B must be a non-zero element of the local group")]
+    InvalidPublicKey,
+
+    /// The generator `g` carried by the handshake does not match the one the
+    /// local group fixes. The client must never compute with a
+    /// server-supplied `g`, or a malicious server could downgrade the group
+    /// arithmetic behind the caller's back.
+    #[error("the handshake generator g does not match the local group")]
+    InvalidGenerator,
+
+    /// The multiplier `k` carried by the handshake does not match the one the
+    /// local group derives. Like `g`, `k` is a group parameter, not a
+    /// per-session value, so a mismatch aborts the handshake.
+    #[error("the handshake multiplier k does not match the local group")]
+    InvalidMultiplier,
+
     /// The string was not an even-length run of hex digits.
     #[error("The provided string is not an even-length hex string")]
     InvalidHexString,

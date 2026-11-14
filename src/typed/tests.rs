@@ -8,6 +8,24 @@ use crate::hash::HASH_LENGTH;
 #[cfg(feature = "wow-1-12-1")]
 use crate::group::GroupWow;
 
+/// Builds a `PublicKey` holding an all-zero element, bypassing the typed
+/// constructor. Only tests use this: it models a hand-crafted or corrupted
+/// handshake that never crossed [`PublicKey::try_from_bytes`], letting the
+/// client-side boundary check prove it fails closed.
+fn invalid_zero_public_key<G: GroupOps>(zero_bytes: &[u8]) -> PublicKey<G> {
+    // SAFETY: `PublicKey<G>` is a single-field newtype over `FieldElement<G>`
+    // with no extra fields or niches; the memory representation is identical.
+    let zero_element = FieldElement::<G>::from_bytes_unchecked(zero_bytes);
+    unsafe { std::mem::transmute::<FieldElement<G>, PublicKey<G>>(zero_element) }
+}
+
+fn trim_leading_zeroes(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|byte| *byte != 0) {
+        Some(start) => &bytes[start..],
+        None => &bytes[bytes.len() - 1..],
+    }
+}
+
 fn round_trip<G: GroupOps>(group: G) {
     let srp = Srp6::new(group);
     let username = Username::new("alice").expect("valid username");
@@ -79,6 +97,159 @@ fn a_zero_premaster_from_a_malicious_server_is_refused() {
         srp.calculate_proof(&handshake, &username, "password123"),
         Err(crate::Srp6Error::InvalidPremaster)
     ));
+}
+
+#[test]
+fn a_handshake_with_a_tampered_generator_is_refused() {
+    let srp = Srp6::new(Group2048);
+    let username = Username::new("alice").expect("valid username");
+    let (salt, verifier) = srp.generate_new_user_secrets(&username, "password123");
+    let (handshake, _) = srp
+        .start_handshake(&username, salt, verifier)
+        .expect("the handshake starts");
+
+    // A valid field element, but not the group's generator: the client must
+    // refuse to compute with a server-chosen `g`.
+    let rogue_g = FieldElement::try_from_bytes(&[3_u8]).expect("a valid field element");
+    let tampered = Handshake {
+        B: handshake.B.clone(),
+        g: rogue_g,
+        k: handshake.k.clone(),
+        s: handshake.s.clone(),
+    };
+
+    assert!(matches!(
+        srp.calculate_proof(&tampered, &username, "password123"),
+        Err(crate::Srp6Error::InvalidGenerator)
+    ));
+}
+
+#[test]
+fn a_handshake_with_a_tampered_multiplier_is_refused() {
+    let srp = Srp6::new(Group2048);
+    let group = Group2048;
+    let username = Username::new("alice").expect("valid username");
+    let (salt, verifier) = srp.generate_new_user_secrets(&username, "password123");
+    let (handshake, _) = srp
+        .start_handshake(&username, salt, verifier)
+        .expect("the handshake starts");
+
+    let local_k = group.multiplier().expect("the local multiplier");
+    let rogue_k_field = group.field_add(&local_k, &local_k);
+    let rogue_k = FieldElement::from_field(&group, &rogue_k_field);
+    assert_ne!(rogue_k, handshake.k, "the rogue value must differ");
+    let tampered = Handshake {
+        B: handshake.B.clone(),
+        g: handshake.g.clone(),
+        k: rogue_k,
+        s: handshake.s.clone(),
+    };
+
+    assert!(matches!(
+        srp.calculate_proof(&tampered, &username, "password123"),
+        Err(crate::Srp6Error::InvalidMultiplier)
+    ));
+}
+
+#[test]
+fn a_handshake_with_a_degenerate_public_key_is_refused_before_computation() {
+    let srp = Srp6::new(Group2048);
+    let username = Username::new("alice").expect("valid username");
+    let (salt, verifier) = srp.generate_new_user_secrets(&username, "password123");
+    let (handshake, _) = srp
+        .start_handshake(&username, salt.clone(), verifier)
+        .expect("the handshake starts");
+
+    // A hand-crafted handshake never crosses the typed `PublicKey`
+    // constructor, so the client must re-enforce the boundary itself.
+    let zero = vec![0_u8; Group2048::N_BYTES];
+    let degenerate = Handshake {
+        B: invalid_zero_public_key(&zero),
+        g: handshake.g.clone(),
+        k: handshake.k.clone(),
+        s: handshake.s.clone(),
+    };
+
+    assert!(matches!(
+        srp.calculate_proof(&degenerate, &username, "password123"),
+        Err(crate::Srp6Error::InvalidPublicKey)
+    ));
+}
+
+#[test]
+fn a_handshake_carrying_another_groups_parameters_is_refused() {
+    let srp = Srp6::new(Group2048);
+    let username = Username::new("alice").expect("valid username");
+    let (salt, verifier) = srp.generate_new_user_secrets(&username, "password123");
+    let (handshake, _) = srp
+        .start_handshake(&username, salt, verifier)
+        .expect("the handshake starts");
+
+    // A parameter-substitution / downgrade attempt: the 4096-bit group's
+    // generator `g = 5` is a perfectly valid 2048-bit field element, but it is
+    // not the 2048-bit group's generator `g = 2`. The binding check must tell
+    // them apart rather than accepting any well-formed element.
+    let other = Group4096;
+    let foreign_g = FieldElement::<Group2048>::try_from_bytes(trim_leading_zeroes(
+        other.generator_bytes().as_slice(),
+    ))
+    .expect("the foreign generator is a valid element of the local field");
+    assert_ne!(foreign_g, handshake.g);
+    let foreign = Handshake {
+        B: handshake.B.clone(),
+        g: foreign_g,
+        k: handshake.k.clone(),
+        s: handshake.s.clone(),
+    };
+
+    assert!(matches!(
+        srp.calculate_proof(&foreign, &username, "password123"),
+        Err(crate::Srp6Error::InvalidGenerator)
+    ));
+
+    // The multiplier is just as binding: substitute the 4096-bit `k` bytes.
+    let foreign_k = FieldElement::<Group2048>::try_from_bytes(trim_leading_zeroes(
+        other.multiplier_bytes().as_slice(),
+    ))
+    .expect("the foreign multiplier fits the local field");
+    assert_ne!(foreign_k, handshake.k);
+    let foreign = Handshake {
+        B: handshake.B.clone(),
+        g: handshake.g.clone(),
+        k: foreign_k,
+        s: handshake.s.clone(),
+    };
+
+    assert!(matches!(
+        srp.calculate_proof(&foreign, &username, "password123"),
+        Err(crate::Srp6Error::InvalidMultiplier)
+    ));
+
+    // The untouched handshake still proves: the binding rejects substitutions,
+    // not the group's own parameters.
+    srp.calculate_proof(&handshake, &username, "password123")
+        .expect("the genuine handshake still proves");
+}
+
+#[test]
+fn a_handshake_with_the_local_groups_parameters_is_accepted() {
+    let srp = Srp6::new(Group2048);
+    let group = Group2048;
+    let username = Username::new("alice").expect("valid username");
+    let (salt, _verifier) = srp.generate_new_user_secrets(&username, "password123");
+
+    // Rebuild the handshake from the group's own parameters and a fresh,
+    // valid `B`: the binding checks must pass and the proof must compute.
+    let valid_b = group.field_add(&group.generator(), &group.generator());
+    let rebuilt = Handshake {
+        B: PublicKey::from_field(&group, &valid_b),
+        g: FieldElement::from_field(&group, &group.generator()),
+        k: FieldElement::from_field(&group, &group.multiplier().expect("the multiplier")),
+        s: salt,
+    };
+
+    srp.calculate_proof(&rebuilt, &username, "password123")
+        .expect("a well-formed, locally bound handshake proves");
 }
 
 #[test]

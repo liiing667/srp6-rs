@@ -31,6 +31,20 @@ impl<G: Group> FieldElement<G> {
     pub fn to_vec(&self) -> Vec<u8> {
         self.bytes.to_vec()
     }
+
+    /// Test-only escape hatch that skips the non-zero field-element check.
+    ///
+    /// Production values always cross [`FieldElement::try_from_bytes`]; tests
+    /// use this to model a hand-crafted or corrupted handshake that bypassed
+    /// the typed constructor, so the client-side boundary checks can prove
+    /// they fail closed.
+    #[cfg(test)]
+    pub(crate) fn from_bytes_unchecked(bytes: &[u8]) -> Self {
+        Self {
+            bytes: bytes.to_vec().into_boxed_slice(),
+            _group: PhantomData,
+        }
+    }
 }
 
 impl<G: GroupOps> FieldElement<G> {
